@@ -49,7 +49,8 @@ fetch_all_injury_data <- function() {
   
   for (url in file_urls) {
     temp_zip <- tempfile(fileext = ".zip")
-    temp_dir <- tempdir()
+    temp_dir <- tempfile()  # Create a unique temp directory for each file
+    dir.create(temp_dir)
     
     response <- httr::GET(url, httr::write_disk(temp_zip, overwrite = TRUE))
     if (httr::status_code(response) != 200) {
@@ -57,6 +58,7 @@ fetch_all_injury_data <- function() {
     }
     unzip(temp_zip, exdir = temp_dir)
     csv_file <- list.files(temp_dir, pattern = "\\.csv$", full.names = TRUE)
+    print(csv_file)  # Check what files have been extracted
     if (length(csv_file) == 0) {
       stop(paste("No CSV file found in the ZIP archive from", url))
     }
@@ -65,6 +67,7 @@ fetch_all_injury_data <- function() {
       mutate(Body_Part = as.numeric(Body_Part))
     
     combined_data <- bind_rows(combined_data, injury_data)
+    unlink(temp_dir, recursive = TRUE)  # Clean up the temporary directory
   }
   
   return(combined_data)
