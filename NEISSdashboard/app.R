@@ -3,6 +3,8 @@ library(ggplot2)
 library(dplyr)
 library(readr)
 library(httr)
+library(lubridate)
+library(forecast)
 
 # Lookup table for Body_Part codes and their corresponding labels
 body_part_labels <- data.frame(
@@ -58,7 +60,7 @@ fetch_all_injury_data <- function() {
     }
     unzip(temp_zip, exdir = temp_dir)
     csv_file <- list.files(temp_dir, pattern = "\\.csv$", full.names = TRUE)
-    print(csv_file)  # Check what files have been extracted
+    print(csv_file) 
     if (length(csv_file) == 0) {
       stop(paste("No CSV file found in the ZIP archive from", url))
     }
@@ -67,10 +69,29 @@ fetch_all_injury_data <- function() {
       mutate(Body_Part = as.numeric(Body_Part))
     
     combined_data <- bind_rows(combined_data, injury_data)
-    unlink(temp_dir, recursive = TRUE)  # Clean up the temporary directory
+    unlink(temp_dir, recursive = TRUE)
   }
   
   return(combined_data)
+}
+
+perform_sarima_forecasting <- function(data, h = 1) {
+  sarima_fit <- auto.arima(data, seasonal = TRUE, seasonal.test = "ocsb", stepwise = FALSE)
+  forecasted_values <- forecast(sarima_fit, h = h)
+  
+  # Calculate accuracy if you have actual values to compare against
+  accuracy_measures <- if (h <= length(data)) accuracy(forecasted_values, data[(length(data)-h+1):length(data)])
+  
+  # Returning model statistics as part of the list
+  list(
+    Forecast = forecasted_values,
+    Stats = list(
+      AIC = sarima_fit$aic,
+      BIC = sarima_fit$bic,
+      Accuracy = accuracy_measures  # Assuming 'accuracy' includes metrics like MAE, RMSE, etc.
+    ),
+    Model = sarima_fit
+  )
 }
 
 ui <- fluidPage(
@@ -87,9 +108,14 @@ ui <- fluidPage(
     mainPanel(
       h3("Timeseries Visualization"),
       plotOutput("timeSeriesPlot"),
+      h4("SARIMA Model Statistics"),
+      p("Seasonal AutoRegressive Integrated Moving Average (SARIMA) is a statistical model used to forecast time series data that exhibits both non-seasonal and seasonal patterns."),
+      verbatimTextOutput("modelStats"),
       h3("Descriptive Statistics"),
       h4("Patient Demographics"),
-      tableOutput("statsTable")
+      tableOutput("statsTable"),
+      h4("Patient Disposition"),
+      plotOutput("dispositionPlot")
     )
   )
 )
@@ -97,7 +123,9 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   # Reactive function to fetch and process all injury data
   injury_data <- reactive({
+    
     data <- fetch_all_injury_data()
+    
     data <- data %>%
       left_join(body_part_labels, by = c("Body_Part" = "Code")) %>%
       mutate(Treatment_Date = as.Date(Treatment_Date, format = "%m/%d/%y"))
@@ -147,18 +175,115 @@ server <- function(input, output, session) {
   
   # Render the timeseries plot
   output$timeSeriesPlot <- renderPlot({
-    req(input$body_part, input$date_range)
+    req(input$body_part, input$date_range)  # Ensure required inputs are available
+    
+    # Filter and summarize the training data
     filtered_data <- injury_data() %>%
       filter(Label == input$body_part, Treatment_Date >= input$date_range[1], Treatment_Date <= input$date_range[2]) %>%
       group_by(Treatment_Date) %>%
-      summarize(Frequency = n(), .groups = "drop")
-    if (nrow(filtered_data) == 0) return(NULL)
-    ggplot(filtered_data, aes(x = Treatment_Date, y = Frequency)) +
-      geom_line(color = "blue") +
-      geom_point(color = "red") +
-      labs(title = paste("Injury Trends for:", input$body_part), x = "Date", y = "Number of Injuries") +
+      summarize(Frequency = n(), .groups = "drop") %>%
+      ungroup() %>%
+      as.data.frame()  # Ensure this is a data frame
+    
+    if (nrow(filtered_data) == 0) {
+      return(NULL)  # Return nothing if there's no data
+    }
+    
+    # Define the split point for in-sample and out-of-sample data
+    split_point <- floor(nrow(filtered_data) * 0.8)
+    train_data <- filtered_data[1:split_point, ]
+    test_data <- filtered_data[(split_point + 1):nrow(filtered_data), ]
+    
+    # Ensure both are data frames
+    train_data <- as.data.frame(train_data)
+    test_data <- as.data.frame(test_data)
+    
+    # Perform SARIMA forecasting on in-sample data
+    results <- tryCatch({
+      perform_sarima_forecasting(train_data$Frequency, h = nrow(test_data))  # Specify horizon h
+    }, error = function(e) {
+      print(paste("Error in SARIMA computation:", e$message))
+      NULL  # Return NULL on error
+    })
+    
+    if (is.null(results) || is.null(results$Forecast)) {
+      return(NULL)  # Return nothing if forecasting failed
+    }
+    
+    # Forecast dates should only include the test range
+    forecast_dates <- test_data$Treatment_Date
+    
+    # Create the plot with both observed and forecasted data
+    p <- ggplot() +
+      geom_line(data = train_data, aes(x = Treatment_Date, y = Frequency), color = "blue", linewidth = 0.5) +  # Observed data
+      geom_line(data = test_data, aes(x = Treatment_Date, y = Frequency), color = "black", linewidth = 1, linetype = "dashed") +  # Actual test data
+      geom_line(aes(x = forecast_dates, y = results$Forecast$mean), color = "red", linewidth = 1) +  # Forecasted data
+      geom_ribbon(aes(x = forecast_dates, ymin = results$Forecast$lower[, "80%"], ymax = results$Forecast$upper[, "80%"]), fill = "red", alpha = 0.2) +  # Confidence interval
+      labs(title = paste("SARIMA Model Forecast vs Actual Data for", input$body_part), x = "Year-Month", y = "Number of Injuries") +
       theme_minimal()
+    
+    return(p)  # Return the plot
   })
+  
+  output$dispositionPlot <- renderPlot({
+    req(input$body_part, input$date_range)  # Ensure required inputs are available
+    
+    disposition_data <- injury_data() %>%
+      filter(Label == input$body_part, Treatment_Date >= input$date_range[1], Treatment_Date <= input$date_range[2]) %>%
+      group_by(Disposition)
+    
+    disposition_plot <- ggplot(disposition_data, aes(x = disposition, y = Frequency)) +
+      geom_bar(stat = "identity", fill = "blue") +
+      labs(title = "Patient Disposition", x = "Disposition", y = "Frequency") +
+      theme_minimal()
+    
+    return(disposition_plot)
+  })
+  
+  # Render SARIMA model statistics
+  output$modelStats <- renderPrint({
+    req(input$body_part, input$date_range)
+    
+    # Filter and summarize the training data
+    filtered_data <- injury_data() %>%
+      filter(Label == input$body_part, Treatment_Date >= input$date_range[1], Treatment_Date <= input$date_range[2]) %>%
+      group_by(Treatment_Date) %>%
+      summarize(Frequency = n(), .groups = "drop") %>%
+      ungroup()
+    
+    if (nrow(filtered_data) == 0) {
+      return("No data available for the selected range and body part.")
+    }
+    
+    # Define the split point for in-sample and out-of-sample data
+    split_point <- floor(nrow(filtered_data) * 0.8)
+    train_data <- filtered_data[1:split_point, ]
+    test_data <- filtered_data[(split_point + 1):nrow(filtered_data), ]
+    
+    # Perform SARIMA forecasting
+    results <- tryCatch({
+      perform_sarima_forecasting(train_data$Frequency, h = nrow(test_data))
+    }, error = function(e) {
+      return(paste("Error in SARIMA computation:", e$message))
+    })
+    
+    if (is.null(results)) {
+      return("Failed to compute SARIMA model.")
+    }
+    
+    # Extract and display model statistics
+    stats <- results$Stats
+    cat("SARIMA Model Statistics:\n")
+    cat("AIC:", stats$AIC, "\n")
+    cat("BIC:", stats$BIC, "\n")
+    if (!is.null(stats$Accuracy)) {
+      cat("Accuracy Metrics (for forecasted data):\n")
+      print(stats$Accuracy)
+    } else {
+      cat("No accuracy metrics available.\n")
+    }
+  })
+  
   
   # Render the descriptive statistics table
   output$statsTable <- renderTable({
@@ -177,6 +302,8 @@ server <- function(input, output, session) {
     )
     return(stats)
   })
+  
+  
 }
 
 shinyApp(ui, server)
