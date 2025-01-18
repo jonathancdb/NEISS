@@ -115,7 +115,31 @@ ui <- fluidPage(
       h4("Patient Demographics"),
       tableOutput("statsTable"),
       h4("Patient Disposition"),
-      plotOutput("dispositionPlot")
+      p("Patient dispositions, as defined by the NEISS Coding Manual are as follows:",
+        tags$ul(
+          tags$li("1: Treated and released, or examined and released without treatment"),
+          tags$li("2: Treated and transferred to another hospital"),
+          tags$li("4: Treated and admitted for hospitalization (within same facility)"),
+          tags$li("5: Held for observation (includes admitted for observation)"),
+          tags$li("6: Left without being seen, Left against medical advice, Left without treatment, Eloped"),
+          tags$li("8: Fatality, includes dead on arrival (“DOA”), died in the ED, and died after admission"),
+          tags$li("9: Not recorded")
+        )
+      ),
+      plotOutput("dispositionPlot"),
+      h4("Authors"),
+      div(style="font-size:14px; font-family:Arial, sans-serif;",
+          p("Jonathan Collard de Beaufort, BS", tags$sup("1"))
+      ),
+      tags$ol(
+        tags$li("Norton College of Medicine, SUNY Upstate, Syracuse NY")
+      ),
+      h4("Citation"),
+      p(
+        tags$ul(
+          tags$li("US Consumer Product Safety Commission. National Electronic Injury Surveillance System (NEISS) Available at: https://www.cpsc.gov/Research–Statistics/NEISS-Injury-Data. Accessed January 11, 2025.")
+        )  
+      )
     )
   )
 )
@@ -230,12 +254,16 @@ server <- function(input, output, session) {
     
     disposition_data <- injury_data() %>%
       filter(Label == input$body_part, Treatment_Date >= input$date_range[1], Treatment_Date <= input$date_range[2]) %>%
-      group_by(Disposition)
+      group_by(Disposition) %>%
+      summarize(count = n())  # Count the number of occurrences for each disposition
     
-    disposition_plot <- ggplot(disposition_data, aes(x = disposition, y = Frequency)) +
+    disposition_data$Disposition <- factor(disposition_data$Disposition)  # Convert Disposition to a factor
+    
+    disposition_plot <- ggplot(disposition_data, aes(x = Disposition, y = count)) +
       geom_bar(stat = "identity", fill = "blue") +
       labs(title = "Patient Disposition", x = "Disposition", y = "Frequency") +
-      theme_minimal()
+      theme_minimal() +
+      scale_x_discrete(drop = FALSE)  # Optional: to include all possible dispositions in the x-axis
     
     return(disposition_plot)
   })
