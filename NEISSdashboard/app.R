@@ -98,7 +98,7 @@ ui <- fluidPage(
   titlePanel("NEISS: Injury Trends Dashboard"),
   sidebarLayout(
     sidebarPanel(
-      selectInput("body_part", "Select a Body Part:", choices = NULL, selected = NULL),
+      selectInput("body_part", "Select a Body Part:", choices = NULL, selected = "Head"),
       dateRangeInput("date_range", "Select Date Range:", start = NULL, end = NULL, min = NULL, max = NULL, format = "yyyy-mm-dd"),
       actionButton("last_month", "Last Month"),
       actionButton("last_3_months", "Last 3 Months"),
@@ -106,15 +106,20 @@ ui <- fluidPage(
       actionButton("max_time", "ALL")
     ),
     mainPanel(
+      h3("Project Synopsis"),
+      p("The National Electronic Injury Surveillance System (NEISS) provides detailed data on consumer product-related injuries and deaths in the U.S. While this data is accessible online, it is stored in large files that can be challenging to handle. This web application addresses these challenges by offering pre-built analysis and customizable statistics, making the data more accessible for individuals, researchers, and hospital administrators."),
+      p("NEISS collects data on injuries from participating hospitals across the United States. To protect patient confidentiality, location details are excluded from the reports. However, basic patient demographics, such as age and gender, along with the disposition—such as whether the patient was treated and released or admitted—are included."),
       h3("Timeseries Visualization"),
       plotOutput("timeSeriesPlot"),
+      h3("SARIMA Visualization"),
+      plotOutput("sarimaPlot"),
       h4("SARIMA Model Statistics"),
       p("Seasonal AutoRegressive Integrated Moving Average (SARIMA) is a statistical model used to forecast time series data that exhibits both non-seasonal and seasonal patterns."),
       verbatimTextOutput("modelStats"),
       h3("Descriptive Statistics"),
       h4("Patient Demographics"),
       tableOutput("statsTable"),
-      h4("Patient Disposition"),
+      h4("Patient Disposition Histogram"),
       p("Patient dispositions, as defined by the NEISS Coding Manual are as follows:",
         tags$ul(
           tags$li("1: Treated and released, or examined and released without treatment"),
@@ -127,6 +132,8 @@ ui <- fluidPage(
         )
       ),
       plotOutput("dispositionPlot"),
+      h4("Patient Disposition Timeseries"),
+      plotOutput("dispositionTimeseries"),
       h4("Authors"),
       div(style="font-size:14px; font-family:Arial, sans-serif;",
           p("Jonathan Collard de Beaufort, BS", tags$sup("1"))
@@ -201,7 +208,6 @@ server <- function(input, output, session) {
   output$timeSeriesPlot <- renderPlot({
     req(input$body_part, input$date_range)  # Ensure required inputs are available
     
-    # Filter and summarize the training data
     filtered_data <- injury_data() %>%
       filter(Label == input$body_part, Treatment_Date >= input$date_range[1], Treatment_Date <= input$date_range[2]) %>%
       group_by(Treatment_Date) %>%
@@ -213,40 +219,95 @@ server <- function(input, output, session) {
       return(NULL)  # Return nothing if there's no data
     }
     
-    # Define the split point for in-sample and out-of-sample data
+    p <- ggplot() +
+      geom_line(data = filtered_data, aes(x = Treatment_Date, y = Frequency), color = "blue", linewidth = 0.5) +  # Observed data
+      labs(title = paste("Timeseries Plot", input$body_part), x = "Year-Month", y = "Number of Injuries") +
+      theme_minimal()
+    
+    return(p)
+    
+  })
+  
+  # Reactive function that generates the SARIMA model
+  
+  sarimaResults <- reactive({
+    req(input$body_part)  # Ensure the input is available
+    
+    filtered_data <- injury_data() %>%
+      filter(Label == input$body_part) %>%
+      group_by(Treatment_Date) %>%
+      summarize(Frequency = n(), .groups = "drop") %>%
+      ungroup() %>%
+      as.data.frame()
+    
+    if (nrow(filtered_data) == 0) {
+      return(list(dataAvailable = FALSE))  # Return indication that no data is available
+    }
+    
     split_point <- floor(nrow(filtered_data) * 0.8)
     train_data <- filtered_data[1:split_point, ]
     test_data <- filtered_data[(split_point + 1):nrow(filtered_data), ]
     
-    # Ensure both are data frames
-    train_data <- as.data.frame(train_data)
-    test_data <- as.data.frame(test_data)
-    
-    # Perform SARIMA forecasting on in-sample data
-    results <- tryCatch({
-      perform_sarima_forecasting(train_data$Frequency, h = nrow(test_data))  # Specify horizon h
+    model_results <- tryCatch({
+      perform_sarima_forecasting(train_data$Frequency, h = nrow(test_data))
     }, error = function(e) {
       print(paste("Error in SARIMA computation:", e$message))
-      NULL  # Return NULL on error
+      NULL
     })
     
-    if (is.null(results) || is.null(results$Forecast)) {
-      return(NULL)  # Return nothing if forecasting failed
+    list(dataAvailable = TRUE, train_data = train_data, test_data = test_data, results = model_results)
+  })
+  
+  # Render the SARIMA plot
+  output$sarimaPlot <- renderPlot({
+    sarima_output <- sarimaResults()  # Get the data and results from the reactive expression
+    if (!sarima_output$dataAvailable || is.null(sarima_output$results) || is.null(sarima_output$results$Forecast)) {
+      return(NULL)
     }
     
-    # Forecast dates should only include the test range
-    forecast_dates <- test_data$Treatment_Date
+    forecast_dates <- sarima_output$test_data$Treatment_Date
     
-    # Create the plot with both observed and forecasted data
-    p <- ggplot() +
-      geom_line(data = train_data, aes(x = Treatment_Date, y = Frequency), color = "blue", linewidth = 0.5) +  # Observed data
-      geom_line(data = test_data, aes(x = Treatment_Date, y = Frequency), color = "black", linewidth = 1, linetype = "dashed") +  # Actual test data
-      geom_line(aes(x = forecast_dates, y = results$Forecast$mean), color = "red", linewidth = 1) +  # Forecasted data
-      geom_ribbon(aes(x = forecast_dates, ymin = results$Forecast$lower[, "80%"], ymax = results$Forecast$upper[, "80%"]), fill = "red", alpha = 0.2) +  # Confidence interval
+    ggplot() +
+      geom_line(data = sarima_output$train_data, aes(x = Treatment_Date, y = Frequency), color = "blue", linewidth = 0.5) +
+      geom_line(data = sarima_output$test_data, aes(x = Treatment_Date, y = Frequency), color = "black", linewidth = 1, linetype = "dashed") +
+      geom_line(aes(x = forecast_dates, y = sarima_output$results$Forecast$mean), color = "red", linewidth = 1) +
+      geom_ribbon(aes(x = forecast_dates, ymin = sarima_output$results$Forecast$lower[, "80%"], ymax = sarima_output$results$Forecast$upper[, "80%"]), fill = "red", alpha = 0.2) +
       labs(title = paste("SARIMA Model Forecast vs Actual Data for", input$body_part), x = "Year-Month", y = "Number of Injuries") +
       theme_minimal()
+  })
+  
+  # Render SARIMA model statistics
+  output$modelStats <- renderPrint({
+    sarima_output <- sarimaResults()  # Get the data and results from the reactive expression
     
-    return(p)  # Return the plot
+    # Check if data was available and if results are not null
+    if (!sarima_output$dataAvailable || is.null(sarima_output$results)) {
+      cat("No SARIMA model results available.")
+      return()
+    }
+    
+    # Assuming 'Stats' is part of the results object returned from the forecasting function
+    # You might need to adjust this if the structure of results from perform_sarima_forecasting() is different
+    stats <- sarima_output$results$Stats  # Access the stats part of the results
+    
+    cat("SARIMA Model Statistics:\n")
+    if (!is.null(stats$AIC)) {
+      cat("AIC:", stats$AIC, "\n")
+    } else {
+      cat("AIC not available.\n")
+    }
+    if (!is.null(stats$BIC)) {
+      cat("BIC:", stats$BIC, "\n")
+    } else {
+      cat("BIC not available.\n")
+    }
+    
+    if (!is.null(stats$Accuracy)) {
+      cat("Accuracy Metrics (for forecasted data):\n")
+      print(stats$Accuracy)
+    } else {
+      cat("No accuracy metrics available.\n")
+    }
   })
   
   output$dispositionPlot <- renderPlot({
@@ -268,49 +329,29 @@ server <- function(input, output, session) {
     return(disposition_plot)
   })
   
-  # Render SARIMA model statistics
-  output$modelStats <- renderPrint({
-    req(input$body_part, input$date_range)
+  output$dispositionTimeseries <- renderPlot({
+    req(input$body_part)  # Ensure required inputs are available
     
-    # Filter and summarize the training data
-    filtered_data <- injury_data() %>%
-      filter(Label == input$body_part, Treatment_Date >= input$date_range[1], Treatment_Date <= input$date_range[2]) %>%
-      group_by(Treatment_Date) %>%
-      summarize(Frequency = n(), .groups = "drop") %>%
-      ungroup()
+    disposition_data <- injury_data() %>%
+      filter(Label == input$body_part) %>%
+      group_by(Treatment_Date, Disposition) %>%
+      summarise(count = n(), .groups = 'drop') %>%
+      as.data.frame()
     
-    if (nrow(filtered_data) == 0) {
-      return("No data available for the selected range and body part.")
+    if (nrow(disposition_data) == 0) {
+      return(NULL)  # Return nothing if there's no data
     }
     
-    # Define the split point for in-sample and out-of-sample data
-    split_point <- floor(nrow(filtered_data) * 0.8)
-    train_data <- filtered_data[1:split_point, ]
-    test_data <- filtered_data[(split_point + 1):nrow(filtered_data), ]
+    disposition_data$Disposition <- factor(disposition_data$Disposition, levels = unique(disposition_data$Disposition))
     
-    # Perform SARIMA forecasting
-    results <- tryCatch({
-      perform_sarima_forecasting(train_data$Frequency, h = nrow(test_data))
-    }, error = function(e) {
-      return(paste("Error in SARIMA computation:", e$message))
-    })
+    disposition_plot <- ggplot(disposition_data, aes(x = Treatment_Date, y = count, group = Disposition, color = Disposition)) +
+      geom_line(size = 0.5) +
+      labs(title = "Timeseries of Patient Disposition", x = "Time", y = "Frequency") +
+      theme_minimal()
     
-    if (is.null(results)) {
-      return("Failed to compute SARIMA model.")
-    }
-    
-    # Extract and display model statistics
-    stats <- results$Stats
-    cat("SARIMA Model Statistics:\n")
-    cat("AIC:", stats$AIC, "\n")
-    cat("BIC:", stats$BIC, "\n")
-    if (!is.null(stats$Accuracy)) {
-      cat("Accuracy Metrics (for forecasted data):\n")
-      print(stats$Accuracy)
-    } else {
-      cat("No accuracy metrics available.\n")
-    }
+    return(disposition_plot)
   })
+  
   
   
   # Render the descriptive statistics table
