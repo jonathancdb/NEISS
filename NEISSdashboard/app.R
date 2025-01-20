@@ -44,7 +44,8 @@ fetch_all_injury_data <- function() {
   file_urls <- c(
     "https://raw.githubusercontent.com/jonathancdb/NEISS/main/neiss2022.csv.zip",
     "https://raw.githubusercontent.com/jonathancdb/NEISS/main/neiss2021.csv.zip",
-    "https://raw.githubusercontent.com/jonathancdb/NEISS/main/neiss2020.csv.zip"
+    "https://raw.githubusercontent.com/jonathancdb/NEISS/main/neiss2020.csv.zip",
+    "https://raw.githubusercontent.com/jonathancdb/NEISS/main/neiss2019.csv.zip"
   )
   
   combined_data <- data.frame()
@@ -76,7 +77,17 @@ fetch_all_injury_data <- function() {
 }
 
 perform_sarima_forecasting <- function(data, h = 1) {
-  sarima_fit <- auto.arima(data, seasonal = TRUE, seasonal.test = "ocsb", stepwise = FALSE)
+  sarima_fit <- auto.arima(
+    data, 
+    seasonal = TRUE,         # Include seasonal components
+    stepwise = FALSE,        # Perform an exhaustive search
+    approximation = FALSE    # Ensure accuracy, no approximations
+  )
+  
+  # Past model attempts: 
+  #auto.arima(data, seasonal = TRUE, seasonal.test = "ocsb", stepwise = FALSE)
+  
+  
   forecasted_values <- forecast(sarima_fit, h = h)
   
   # Calculate accuracy if you have actual values to compare against
@@ -107,7 +118,7 @@ ui <- fluidPage(
     ),
     mainPanel(
       h3("Project Synopsis"),
-      p("The National Electronic Injury Surveillance System (NEISS) provides detailed data on consumer product-related injuries and deaths in the U.S. While this data is accessible online, it is stored in large files that can be challenging to handle. This web application addresses these challenges by offering pre-built analysis and customizable statistics, making the data more accessible for individuals, researchers, and hospital administrators."),
+      p("The National Electronic Injury Surveillance System (NEISS) provides detailed data on consumer product-related injuries and deaths in the U.S. While this data is publicly accessible online, it is stored in large files that can be challenging to handle. This web application addresses these challenges by offering pre-built analysis and customizable statistics, making the data more accessible for individuals, researchers, and hospital administrators."),
       p("NEISS collects data on injuries from participating hospitals across the United States. To protect patient confidentiality, location details are excluded from the reports. However, basic patient demographics, such as age and gender, along with the disposition—such as whether the patient was treated and released or admitted—are included."),
       h3("Timeseries Visualization"),
       plotOutput("timeSeriesPlot"),
@@ -116,6 +127,22 @@ ui <- fluidPage(
       h4("SARIMA Model Statistics"),
       p("Seasonal AutoRegressive Integrated Moving Average (SARIMA) is a statistical model used to forecast time series data that exhibits both non-seasonal and seasonal patterns."),
       verbatimTextOutput("modelStats"),
+      h5("SARIMA Model Explanations (click here to expand)", style="cursor: pointer;", onclick="$('#sarimaExplanations').toggle();"),
+      conditionalPanel(
+        condition = "false",  # Initially hidden
+        id = "sarimaExplanations",
+        tags$ul(
+          tags$li("AIC: Measures the quality of the model with a penalty for the number of parameters."),
+          tags$li("BIC: Similar to AIC but with a stronger penalty, favoring simpler models."),
+          tags$li("ME: Mean Error - Indicates the average forecast bias."),
+          tags$li("RMSE: Root Mean Squared Error - Measures the average magnitude of the forecast error."),
+          tags$li("MAE: Mean Absolute Error - Averages the absolute forecast errors."),
+          tags$li("MPE: Mean Percentage Error - Indicates the percent bias of the model."),
+          tags$li("MAPE: Mean Absolute Percentage Error - Indicates accuracy as a percentage."),
+          tags$li("MASE: Compares the model's MAE against a naive model."),
+          tags$li("ACF1: Autocorrelation at lag 1, helps detect any need for further differencing.")
+        )
+      ),
       h3("Descriptive Statistics"),
       h4("Patient Demographics"),
       tableOutput("statsTable"),
@@ -235,7 +262,9 @@ server <- function(input, output, session) {
     
     filtered_data <- injury_data() %>%
       filter(Label == input$body_part) %>%
-      group_by(Treatment_Date) %>%
+      mutate(Treatment_Date = ymd(Treatment_Date)) %>%  # Convert to Date if necessary
+      mutate(YearMonth = floor_date(Treatment_Date, "month")) %>%  # Extract Year-Month
+      group_by(YearMonth) %>%
       summarize(Frequency = n(), .groups = "drop") %>%
       ungroup() %>%
       as.data.frame()
@@ -249,7 +278,7 @@ server <- function(input, output, session) {
     test_data <- filtered_data[(split_point + 1):nrow(filtered_data), ]
     
     model_results <- tryCatch({
-      perform_sarima_forecasting(train_data$Frequency, h = nrow(test_data))
+      perform_sarima_forecasting(train_data$Frequency, h = length(test_data$Frequency))
     }, error = function(e) {
       print(paste("Error in SARIMA computation:", e$message))
       NULL
@@ -267,9 +296,15 @@ server <- function(input, output, session) {
     
     forecast_dates <- sarima_output$test_data$Treatment_Date
     
+    if (!"Treatment_Date" %in% names(sarima_output$train_data) || !"Treatment_Date" %in% names(sarima_output$test_data)) {
+      print("Treatment_Date not found in the dataset.")
+      print(names(sarima_output$train_data))
+      return(NULL)
+    }
+    
     ggplot() +
-      geom_line(data = sarima_output$train_data, aes(x = Treatment_Date, y = Frequency), color = "blue", linewidth = 0.5) +
-      geom_line(data = sarima_output$test_data, aes(x = Treatment_Date, y = Frequency), color = "black", linewidth = 1, linetype = "dashed") +
+      geom_line(data = sarima_output$train_data, aes(x = YearMonth, y = Frequency), color = "blue", linewidth = 0.5) +
+      geom_line(data = sarima_output$test_data, aes(x = YearMonth, y = Frequency), color = "black", linewidth = 1, linetype = "dashed") +
       geom_line(aes(x = forecast_dates, y = sarima_output$results$Forecast$mean), color = "red", linewidth = 1) +
       geom_ribbon(aes(x = forecast_dates, ymin = sarima_output$results$Forecast$lower[, "80%"], ymax = sarima_output$results$Forecast$upper[, "80%"]), fill = "red", alpha = 0.2) +
       labs(title = paste("SARIMA Model Forecast vs Actual Data for", input$body_part), x = "Year-Month", y = "Number of Injuries") +
@@ -345,7 +380,7 @@ server <- function(input, output, session) {
     disposition_data$Disposition <- factor(disposition_data$Disposition, levels = unique(disposition_data$Disposition))
     
     disposition_plot <- ggplot(disposition_data, aes(x = Treatment_Date, y = count, group = Disposition, color = Disposition)) +
-      geom_line(size = 0.5) +
+      geom_line(linewidth = 0.5) +
       labs(title = "Timeseries of Patient Disposition", x = "Time", y = "Frequency") +
       theme_minimal()
     
